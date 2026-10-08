@@ -12,8 +12,9 @@ import re
 import subprocess
 import hashlib
 import base64
-import struct
-from typing import Optional, Tuple, Dict, List
+import pwd
+import shlex
+from typing import Optional, Dict
 import json
 import logging
 
@@ -24,9 +25,14 @@ logger = logging.getLogger(__name__)
 class SSHKeyParser:
     """Advanced SSH key parser for fingerprint extraction and matching."""
     
-    def __init__(self, authorized_keys_path: str = "/root/.ssh/authorized_keys"):
+    def __init__(self, authorized_keys_path: Optional[str] = None):
+        if authorized_keys_path is None:
+            authorized_keys_path = os.environ.get('SSH_AUTHORIZED_KEYS_PATH')
+        if not authorized_keys_path:
+            username = SSHConnectionDetector._get_username()
+            authorized_keys_path = os.path.join(pwd.getpwnam(username).pw_dir, '.ssh', 'authorized_keys')
         self.authorized_keys_path = authorized_keys_path
-        self.auth_log_path = "/var/log/auth.log"  # Add this line
+        self.auth_log_path = os.environ.get('SSH_AUTH_LOG_PATH', '/var/log/auth.log')
         self.key_cache = {}
         self._load_authorized_keys()
     
@@ -55,27 +61,35 @@ class SSHKeyParser:
     def _parse_authorized_key_line(self, line: str) -> Optional[Dict]:
         """Parse a single authorized_keys line."""
         try:
-            # Split the line into parts
-            parts = line.split()
-            if len(parts) < 2:
+            # Options precede the key and may contain quoted spaces or commas.
+            field = r'(?:[^\s"\\]|\\.|"(?:[^"\\]|\\.)*")+'
+            match = re.fullmatch(
+                r'(?:(?P<options>' + field + r')\s+)?'
+                r'(?P<type>(?:ssh-|ecdsa-|sk-)[^\s]+)\s+'
+                r'(?P<data>[A-Za-z0-9+/]+={0,2})(?:\s+(?P<comment>.*))?', line)
+            if not match:
                 return None
-            
-            # Extract key type and data
-            key_type = parts[0]
-            key_data = parts[1]
-            comment = parts[2] if len(parts) > 2 else ""
+
+            key_type = match.group('type')
+            key_data = match.group('data')
+            comment = match.group('comment') or ''
             
             # Generate fingerprint
             fingerprint = self._generate_fingerprint(key_type, key_data)
+            if fingerprint == 'unknown':
+                return None
             
             # Extract options if present
             options = {}
-            if len(parts) > 3:
-                # Look for environment variables and other options
-                for part in parts[2:-1]:  # Skip key data and comment
-                    if '=' in part:
-                        key, value = part.split('=', 1)
-                        options[key] = value
+            lexer = shlex.shlex(match.group('options') or '', posix=True)
+            lexer.whitespace = ','
+            lexer.whitespace_split = True
+            lexer.commenters = ''
+            for option in lexer:
+                key, separator, value = option.partition('=')
+                options[key] = value if separator else True
+                if key == 'environment' and value.startswith('SSH_USER='):
+                    options['SSH_USER'] = value.split('=', 1)[1]
             
             return {
                 'type': key_type,
@@ -94,7 +108,7 @@ class SSHKeyParser:
         """Generate SSH key fingerprint."""
         try:
             # Decode base64 key data
-            key_bytes = base64.b64decode(key_data)
+            key_bytes = base64.b64decode(key_data, validate=True)
             
             # Generate SHA256 fingerprint (modern OpenSSH style)
             sha256_hash = hashlib.sha256(key_bytes).digest()
@@ -108,14 +122,22 @@ class SSHKeyParser:
     
     def find_key_by_fingerprint(self, fingerprint: str) -> Optional[Dict]:
         """Find key information by fingerprint."""
+        if fingerprint.startswith('SHA256:'):
+            fingerprint = fingerprint[len('SHA256:'):]
         return self.key_cache.get(fingerprint)
     
-    def find_key_by_ip_and_user(self, ip_address: str, username: str) -> Optional[Dict]:
+    def find_key_by_ip_and_user(self, ip_address: str, username: str,
+                                source_port: Optional[str] = None) -> Optional[Dict]:
         """Find key information by IP and username from recent connections."""
         try:
             # Try to find recent connection in auth log
-            auth_parser = AuthLogParser()
-            connection_info = auth_parser.find_recent_ssh_connection(ip_address, username)
+            if os.environ.get('PARSE_AUTH_LOG_FOR_FINGERPRINTS', 'true') != 'true':
+                return self._find_key_from_ssh_environment()
+            auth_parser = AuthLogParser(self.auth_log_path)
+            connection_info = auth_parser.find_recent_ssh_connection(ip_address, username, source_port=source_port)
+            # Password logins do not authenticate with an authorized key.
+            if connection_info and connection_info.get('auth_method') != 'publickey':
+                return None
             
             if connection_info and connection_info.get('fingerprint') != 'unknown':
                 found_key = self.find_key_by_fingerprint(connection_info['fingerprint'])
@@ -129,24 +151,7 @@ class SSHKeyParser:
                 if found_key:
                     return found_key
             
-            # Method 2: Look for the most recent connection in auth log and try to match by key data
-            if os.path.exists(self.auth_log_path):
-                with open(self.auth_log_path, 'r') as f:
-                    lines = f.readlines()
-                    recent_lines = lines[-100:] if len(lines) > 100 else lines
-                    
-                    # Look for the most recent connection from this IP
-                    for line in reversed(recent_lines):
-                        if ip_address in line and "Accepted" in line and "sshd" in line:
-                            # Parse the line to get key data
-                            parsed_line = auth_parser._parse_ssh_connection_line(line)
-                            if parsed_line.get('key_data') != 'unknown':
-                                found_key = self._find_key_by_data(parsed_line['key_data'])
-                                if found_key:
-                                    return found_key
-            
-            # Method 3: If no auth.log, try to determine key from SSH environment
-            # This is a fallback when auth.log is not available
+            # If logs cannot identify the key, use only explicit session metadata.
             return self._find_key_from_ssh_environment()
             
         except Exception as e:
@@ -179,15 +184,9 @@ class SSHKeyParser:
     def _find_key_by_data(self, key_data: str) -> Optional[Dict]:
         """Find key by its data (base64 part)."""
         try:
-            if not os.path.exists(self.authorized_keys_path):
-                return None
-                
-            with open(self.authorized_keys_path, 'r') as f:
-                for line in f:
-                    if line.strip() and not line.startswith('#'):
-                        parts = line.strip().split()
-                        if len(parts) >= 2 and parts[1] == key_data:
-                            return self._parse_authorized_key_line(line.strip())
+            for key_info in self.key_cache.values():
+                if key_info['data'] == key_data:
+                    return key_info
             return None
         except Exception as e:
             logger.error(f"Error finding key by data: {e}")
@@ -213,46 +212,39 @@ class SSHKeyParser:
         return options.get('SSH_USER')
     
     def get_recent_key(self) -> Optional[Dict]:
-        """Get the most recently used key from authorized_keys."""
-        try:
-            # Return the first key as a simple fallback
-            # In a real implementation, you might want to track key usage
-            for key_info in self.key_cache.values():
-                return key_info
-            return None
-        except Exception as e:
-            logger.error(f"Error getting recent key: {e}")
-            return None
+        """Only return a key when the connection explicitly identifies it."""
+        return self._find_key_from_ssh_environment()
 
 class AuthLogParser:
     """Parser for SSH authentication logs."""
     
-    def __init__(self, auth_log_path: str = "/var/log/auth.log"):
-        self.auth_log_path = auth_log_path
-        self.use_journald = not os.path.exists(auth_log_path)
+    def __init__(self, auth_log_path: Optional[str] = None):
+        self.auth_log_path = auth_log_path or os.environ.get('SSH_AUTH_LOG_PATH', '/var/log/auth.log')
+        self.use_journald = not os.path.exists(self.auth_log_path)
     
     def find_recent_ssh_connection(self, ip_address: str, username: str, 
-                                 max_lines: int = 1000) -> Optional[Dict]:
+                                 max_lines: int = 1000, source_port: Optional[str] = None) -> Optional[Dict]:
         """Find recent SSH connection in auth log or journald."""
         try:
             if self.use_journald:
-                return self._find_connection_in_journald(ip_address, username)
+                return self._find_connection_in_journald(ip_address, username, source_port)
             else:
-                return self._find_connection_in_file(ip_address, username, max_lines)
+                return self._find_connection_in_file(ip_address, username, max_lines, source_port)
         except Exception as e:
             logger.error(f"Error parsing auth log: {e}")
             return None
     
-    def _find_connection_in_journald(self, ip_address: str, username: str) -> Optional[Dict]:
+    def _find_connection_in_journald(self, ip_address: str, username: str,
+                                    source_port: Optional[str] = None) -> Optional[Dict]:
         """Find SSH connection in journald."""
         try:
             # Use journalctl to get recent SSH logs
             cmd = [
-                'journalctl', '-u', 'ssh', '--since', '1 hour ago', 
+                'journalctl', '-u', 'ssh', '-u', 'sshd', '--since', '1 hour ago',
                 '--no-pager', '-o', 'short-iso'
             ]
             
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+            result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, timeout=10)
             if result.returncode != 0:
                 logger.warning("Failed to get journald logs")
                 return None
@@ -262,14 +254,8 @@ class AuthLogParser:
             
             # Look for recent SSH connection
             for line in reversed(lines):
-                if line.strip() and self._is_ssh_connection_line(line, ip_address, username):
+                if line.strip() and self._is_ssh_connection_line(line, ip_address, username, source_port):
                     logger.debug(f"Found SSH connection line: {line}")
-                    return self._parse_ssh_connection_line(line)
-            
-            # If no exact match, try to find any recent connection from this IP
-            for line in reversed(lines):
-                if line.strip() and ip_address in line and "Accepted" in line and ("ssh2" in line or "sshd" in line):
-                    logger.debug(f"Found SSH connection by IP: {line}")
                     return self._parse_ssh_connection_line(line)
             
             logger.debug(f"No SSH connection found for IP {ip_address} and user {username}")
@@ -279,7 +265,8 @@ class AuthLogParser:
             logger.error(f"Error parsing journald: {e}")
             return None
     
-    def _find_connection_in_file(self, ip_address: str, username: str, max_lines: int) -> Optional[Dict]:
+    def _find_connection_in_file(self, ip_address: str, username: str, max_lines: int,
+                                 source_port: Optional[str] = None) -> Optional[Dict]:
         """Find SSH connection in auth log file."""
         try:
             if not os.path.exists(self.auth_log_path):
@@ -293,12 +280,7 @@ class AuthLogParser:
             
             # Look for recent SSH connection
             for line in reversed(recent_lines):
-                if self._is_ssh_connection_line(line, ip_address, username):
-                    return self._parse_ssh_connection_line(line)
-            
-            # If no exact match, try to find any recent connection from this IP
-            for line in reversed(recent_lines):
-                if ip_address in line and "Accepted" in line and "sshd" in line:
+                if self._is_ssh_connection_line(line, ip_address, username, source_port):
                     return self._parse_ssh_connection_line(line)
             
             return None
@@ -307,24 +289,13 @@ class AuthLogParser:
             logger.error(f"Error parsing auth log file: {e}")
             return None
     
-    def _is_ssh_connection_line(self, line: str, ip_address: str, username: str) -> bool:
+    def _is_ssh_connection_line(self, line: str, ip_address: str, username: str,
+                                source_port: Optional[str] = None) -> bool:
         """Check if line represents SSH connection for given IP and user."""
-        # Look for successful SSH connection patterns
-        patterns = [
-            rf"Accepted publickey for {re.escape(username)} from {re.escape(ip_address)}",
-            rf"Accepted password for {re.escape(username)} from {re.escape(ip_address)}",
-            rf"Accepted keyboard-interactive for {re.escape(username)} from {re.escape(ip_address)}"
-        ]
-        
-        for pattern in patterns:
-            if re.search(pattern, line):
-                return True
-        
-        # Also check for any accepted connection from this IP (fallback)
-        if ip_address in line and "Accepted" in line and ("ssh2" in line or "sshd" in line):
-            return True
-        
-        return False
+        pattern = (rf"Accepted (?:publickey|password|keyboard-interactive(?:/pam)?) for {re.escape(username)} "
+                   rf"from {re.escape(ip_address)} port (?P<port>\d+)\b")
+        match = re.search(pattern, line)
+        return bool(match and (not source_port or match.group('port') == source_port))
     
     def _parse_ssh_connection_line(self, line: str) -> Dict:
         """Parse SSH connection line to extract key information."""
@@ -404,7 +375,7 @@ class SSHConnectionDetector:
             'connection_type': 'unknown',
             'key_fingerprint': 'unknown',
             'key_comment': 'unknown',
-            'ssh_user': None,
+            'ssh_user': '',
             'port': 'unknown',
             'client_version': 'unknown'
         }
@@ -424,7 +395,7 @@ class SSHConnectionDetector:
         info['connection_type'] = SSHConnectionDetector._get_connection_type()
         
         # Get SSH user from environment
-        info['ssh_user'] = os.environ.get('SSH_USER')
+        info['ssh_user'] = os.environ.get('SSH_USER', '')
         
         # Get port
         info['port'] = SSHConnectionDetector._get_source_port()
@@ -449,7 +420,7 @@ class SSHConnectionDetector:
         
         # Try to get from network connections
         try:
-            result = subprocess.run(['ss', '-tnp'], capture_output=True, text=True)
+            result = subprocess.run(['ss', '-tnp'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
             if result.returncode == 0:
                 lines = result.stdout.split('\n')
                 for line in lines:
@@ -467,19 +438,14 @@ class SSHConnectionDetector:
     @staticmethod
     def _get_username() -> str:
         """Get current username."""
-        # Try SSH_USER first
-        ssh_user = os.environ.get('SSH_USER')
-        if ssh_user:
-            return ssh_user
-        
-        # Try to get from environment
-        username = os.environ.get('USER') or os.environ.get('LOGNAME')
+        # Keep the operating system account separate from the optional key label.
+        username = os.environ.get('SSH_LOGIN_USER') or os.environ.get('USER') or os.environ.get('LOGNAME')
         if username:
             return username
         
         # Fall back to whoami
         try:
-            result = subprocess.run(['whoami'], capture_output=True, text=True)
+            result = subprocess.run(['whoami'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
             if result.returncode == 0:
                 return result.stdout.strip()
         except Exception:
@@ -497,6 +463,11 @@ class SSHConnectionDetector:
         # Check for tunnel
         if os.environ.get('SSH_TUNNEL'):
             return 'Tunnel'
+
+        if os.environ.get('SSH_TTY'):
+            return 'Interactive shell'
+        if os.environ.get('SSH_CONNECTION') or os.environ.get('SSH_CLIENT'):
+            return 'Command execution'
         
         # Check if interactive
         if sys.stdin.isatty() and sys.stdout.isatty():
@@ -505,7 +476,7 @@ class SSHConnectionDetector:
         # Try to detect from process tree
         try:
             result = subprocess.run(['ps', '-o', 'cmd=', '-p', str(os.getppid())], 
-                                  capture_output=True, text=True)
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
             if result.returncode == 0:
                 parent_cmd = result.stdout.strip()
                 if 'tunnel' in parent_cmd.lower():
@@ -542,7 +513,8 @@ def main():
         print("  get-info - Get current SSH connection info")
         print("  find-key <fingerprint> - Find key by fingerprint")
         print("  parse-auth-log <ip> <username> - Parse auth log for connection")
-        print("  find-key-by-connection <ip> <username> - Find key by connection info")
+        print("  find-key-by-connection <ip> <username> [port] - Find key by connection info")
+        print("  get-recent-key - Get explicitly identified session key, if available")
         sys.exit(1)
     
     command = sys.argv[1]
@@ -591,12 +563,14 @@ def main():
         username = sys.argv[3]
         
         parser = SSHKeyParser()
-        key_info = parser.find_key_by_ip_and_user(ip_address, username)
+        source_port = sys.argv[4] if len(sys.argv) > 4 else None
+        key_info = parser.find_key_by_ip_and_user(ip_address, username, source_port)
         
         if key_info:
             print(json.dumps(key_info, indent=2))
         else:
-            print("Key not found")
+            print('null')
+            sys.exit(1)
     
     elif command == "get-recent-key":
         parser = SSHKeyParser()

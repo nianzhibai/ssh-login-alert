@@ -11,8 +11,7 @@ set -euo pipefail
 # Script configuration
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONFIG_FILE="/etc/ssh-alert/config.conf"
-LOCK_FILE="/tmp/ssh-alert.lock"
-RATE_LIMIT_DIR="/tmp/ssh-alert-rate-limit"
+RATE_LIMIT_DIR="/run/ssh-alert/rate-limit"
 KEY_PARSER="${SCRIPT_DIR}/key-parser.py"
 
 # Load configuration
@@ -24,6 +23,7 @@ load_config() {
     
     # Source configuration file
     source "$CONFIG_FILE"
+    export SSH_AUTHORIZED_KEYS_PATH SSH_AUTH_LOG_PATH PARSE_AUTH_LOG_FOR_FINGERPRINTS
     
     # Validate required settings
     if [[ -z "${TELEGRAM_BOT_TOKEN:-}" ]]; then
@@ -65,15 +65,21 @@ check_rate_limit() {
     local key="$1"
     local limit_seconds="${2:-300}"
     
-    # Sanitize key for filename
-    local sanitized_key=$(echo "$key" | sed 's/[^a-zA-Z0-9._-]/_/g')
-    local rate_file="${RATE_LIMIT_DIR}/${sanitized_key}"
-    
-    mkdir -p "$RATE_LIMIT_DIR"
+    local key_hash
+    key_hash=$(printf '%s' "$key" | python3 -c 'import hashlib, sys; print(hashlib.sha256(sys.stdin.buffer.read()).hexdigest())')
+    local rate_file="${RATE_LIMIT_DIR}/${key_hash}"
+
+    umask 077
+    mkdir -p "$RATE_LIMIT_DIR" || return 2
+    # Wait only for the same account/IP/key. Other connections run independently.
+    exec 200>"${rate_file}.lock" || return 2
+    flock 200 || return 2
+    RATE_LIMIT_FILE="$rate_file"
     
     if [[ -f "$rate_file" ]]; then
         local last_notification=$(cat "$rate_file")
         local current_time=$(date +%s)
+        [[ "$last_notification" =~ ^[0-9]+$ ]] || last_notification=0
         local time_diff=$((current_time - last_notification))
         
         if [[ $time_diff -lt $limit_seconds ]]; then
@@ -82,8 +88,6 @@ check_rate_limit() {
         fi
     fi
     
-    # Update rate limit file
-    date +%s > "$rate_file"
     return 0
 }
 
@@ -241,38 +245,30 @@ get_connection_info_fallback() {
     fi
     
     # Get username
-    username="${SSH_USER:-$(whoami)}"
+    username="${SSH_LOGIN_USER:-${USER:-$(whoami)}}"
     
     # Get connection type
-    if [[ -t 0 ]] && [[ -t 1 ]]; then
+    if [[ -n "${SSH_TTY:-}" ]]; then
         connection_type="Interactive shell"
     elif [[ -n "${SSH_ORIGINAL_COMMAND:-}" ]]; then
         connection_type="Command execution"
     elif [[ -n "${SSH_TUNNEL:-}" ]]; then
         connection_type="Tunnel"
     else
-        connection_type="Unknown"
+        connection_type="Command execution"
     fi
-    
-    # Return as JSON-like structure
-    cat << EOF
-{
-  "ip_address": "$ip_address",
-  "username": "$username",
-  "connection_type": "$connection_type",
-  "key_fingerprint": "unknown",
-  "key_comment": "unknown",
-  "ssh_user": "${SSH_USER:-}",
-  "port": "unknown",
-  "client_version": "unknown"
-}
-EOF
+
+    python3 - "$ip_address" "$username" "$connection_type" "${SSH_USER:-}" <<'PY'
+import json, sys
+print(json.dumps(dict(zip(('ip_address', 'username', 'connection_type', 'ssh_user'), sys.argv[1:]))))
+PY
 }
 
 # Enhanced key information gathering
 get_key_info() {
     local ip_address="$1"
     local username="$2"
+    local source_port="${3:-}"
     
     if [[ ! -f "$KEY_PARSER" ]]; then
         echo '{"fingerprint": "unknown", "comment": "unknown"}'
@@ -281,7 +277,7 @@ get_key_info() {
     
     # Try to get key info using the new method
     local key_info
-    if key_info=$(python3 "$KEY_PARSER" find-key-by-connection "$ip_address" "$username" 2>/dev/null) && [[ -n "$key_info" ]]; then
+    if key_info=$(python3 "$KEY_PARSER" find-key-by-connection "$ip_address" "$username" "$source_port" 2>/dev/null); then
         echo "$key_info" | python3 -c "
 import sys, json
 try:
@@ -298,53 +294,7 @@ except:
         return
     fi
     
-    # Fallback: try to get the most recently used key from authorized_keys
-    # This is a simple approach when auth.log is not available
-    local recent_key_info
-    if recent_key_info=$(python3 "$KEY_PARSER" get-recent-key 2>/dev/null) && [[ -n "$recent_key_info" ]]; then
-        echo "$recent_key_info" | python3 -c "
-import sys, json
-try:
-    data = json.load(sys.stdin)
-    result = {
-        'fingerprint': data.get('fingerprint', 'unknown'),
-        'comment': data.get('comment', 'unknown'),
-        'ssh_user': data.get('options', {}).get('SSH_USER', '')
-    }
-    print(json.dumps(result))
-except:
-    print('{\"fingerprint\": \"unknown\", \"comment\": \"unknown\"}')
-"
-        return
-    fi
-    
-    # Fallback: try to get key info from auth log
-    local auth_log_info
-    if auth_log_info=$(python3 "$KEY_PARSER" parse-auth-log "$ip_address" "$username" 2>/dev/null) && [[ -n "$auth_log_info" ]]; then
-        local fingerprint=$(echo "$auth_log_info" | python3 -c "import sys, json; data=json.load(sys.stdin); print(data.get('fingerprint', 'unknown'))" 2>/dev/null || echo "unknown")
-        
-        if [[ "$fingerprint" != "unknown" ]]; then
-            # Try to find key in authorized_keys
-            if key_info=$(python3 "$KEY_PARSER" find-key "$fingerprint" 2>/dev/null) && [[ -n "$key_info" ]]; then
-                echo "$key_info" | python3 -c "
-import sys, json
-try:
-    data = json.load(sys.stdin)
-    result = {
-        'fingerprint': data.get('fingerprint', 'unknown'),
-        'comment': data.get('comment', 'unknown'),
-        'ssh_user': data.get('options', {}).get('SSH_USER', '')
-    }
-    print(json.dumps(result))
-except:
-    print('{\"fingerprint\": \"unknown\", \"comment\": \"unknown\"}')
-"
-                return
-            fi
-        fi
-    fi
-    
-    # Fallback
+    # Missing authentication evidence must not be replaced with an arbitrary key.
     echo '{"fingerprint": "unknown", "comment": "unknown"}'
 }
 
@@ -354,11 +304,6 @@ send_telegram_message() {
     local disable_notification="${2:-false}"
     
     local url="https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage"
-    local data="chat_id=${TELEGRAM_CHAT_ID}&text=$(printf '%s\n' "$message" | sed 's/&/%26/g')&parse_mode=Markdown"
-    
-    if [[ "$disable_notification" == "true" ]]; then
-        data="${data}&disable_notification=true"
-    fi
     
     local attempt=1
     local max_attempts="${TELEGRAM_RETRY_ATTEMPTS:-3}"
@@ -367,7 +312,12 @@ send_telegram_message() {
     while [[ $attempt -le $max_attempts ]]; do
         log_debug "Sending Telegram message (attempt $attempt/$max_attempts)"
         
-        local response=$(curl -s -w "\n%{http_code}" -X POST "$url" -d "$data" --connect-timeout 10 --max-time 30)
+        local response
+        response=$(curl -s -w "\n%{http_code}" -X POST "$url" \
+            --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+            --data-urlencode "text=${message}" \
+            --data-urlencode "disable_notification=${disable_notification}" \
+            --connect-timeout 10 --max-time 30) || response="${response:-}"
         local http_code=$(echo "$response" | tail -n1)
         local body=$(echo "$response" | head -n -1)
         
@@ -410,7 +360,7 @@ except:
 }
 
 # Main notification function
-send_ssh_alert() {
+send_ssh_alert() (
     local connection_info="$1"
     local key_info="$2"
     
@@ -418,17 +368,18 @@ send_ssh_alert() {
     local ip_address=$(echo "$connection_info" | python3 -c "import sys, json; data=json.load(sys.stdin); print(data.get('ip_address', 'unknown'))")
     local username=$(echo "$connection_info" | python3 -c "import sys, json; data=json.load(sys.stdin); print(data.get('username', 'unknown'))")
     local connection_type=$(echo "$connection_info" | python3 -c "import sys, json; data=json.load(sys.stdin); print(data.get('connection_type', 'unknown'))")
-    local ssh_user=$(echo "$connection_info" | python3 -c "import sys, json; data=json.load(sys.stdin); print(data.get('ssh_user', ''))")
+    local ssh_user=$(echo "$connection_info" | python3 -c "import sys, json; data=json.load(sys.stdin); print(data.get('ssh_user') or '')")
     
     # Fix username if it's None or unknown
     if [[ "$username" == "None" || "$username" == "unknown" || -z "$username" || "$username" == "null" ]]; then
-        username=$(whoami)
+        username="${SSH_LOGIN_USER:-$(whoami)}"
     fi
+    local login_username="$username"
     
     # Parse key info
     local key_fingerprint=$(echo "$key_info" | python3 -c "import sys, json; data=json.load(sys.stdin); print(data.get('fingerprint', 'unknown'))")
     local key_comment=$(echo "$key_info" | python3 -c "import sys, json; data=json.load(sys.stdin); print(data.get('comment', 'unknown'))")
-    local key_ssh_user=$(echo "$key_info" | python3 -c "import sys, json; data=json.load(sys.stdin); print(data.get('ssh_user', ''))")
+    local key_ssh_user=$(echo "$key_info" | python3 -c "import sys, json; data=json.load(sys.stdin); print(data.get('ssh_user') or '')")
     
     # Use SSH_USER from key if available
     if [[ -n "$key_ssh_user" ]]; then
@@ -450,7 +401,7 @@ send_ssh_alert() {
     fi
     
     # Check if username is excluded from alerts
-    if is_username_excluded "$username"; then
+    if is_username_excluded "$login_username" || is_username_excluded "$username"; then
         log_info "Skipping notification for excluded username: $username"
         return 0
     fi
@@ -483,16 +434,22 @@ send_ssh_alert() {
             ;;
     esac
     
-    # Rate limiting - sanitize key for filename
-    local sanitized_fingerprint=$(echo "$key_fingerprint" | sed 's/[^a-zA-Z0-9]/_/g')
-    local rate_key="${ip_address}_${sanitized_fingerprint}"
+    # Deduplicate only the same account, source IP and key.
+    local rate_key="${login_username}|${ip_address}|${key_fingerprint}"
     local rate_limit_seconds="${RATE_LIMIT_PER_IP:-300}"
     
     if [[ "$connection_type" == "Tunnel" ]]; then
         rate_limit_seconds="${RATE_LIMIT_PER_KEY:-60}"
     fi
     
-    if ! check_rate_limit "$rate_key" "$rate_limit_seconds"; then
+    if check_rate_limit "$rate_key" "$rate_limit_seconds"; then
+        :
+    else
+        local rate_status=$?
+        if [[ $rate_status -ne 1 ]]; then
+            log_error "Could not access rate limiting state"
+            return "$rate_status"
+        fi
         log_debug "Rate limit active for $rate_key"
         return 0
     fi
@@ -512,9 +469,9 @@ send_ssh_alert() {
     
     # Get external IP
     if command -v curl >/dev/null 2>&1; then
-        external_ip=$(curl -s --connect-timeout 5 --max-time 10 ifconfig.me 2>/dev/null || curl -s --connect-timeout 5 --max-time 10 ifconfig.co 2>/dev/null || curl -s --connect-timeout 5 --max-time 10 icanhazip.com 2>/dev/null)
+        external_ip=$(curl -fsS --connect-timeout 5 --max-time 10 https://ifconfig.me 2>/dev/null || curl -fsS --connect-timeout 5 --max-time 10 https://ifconfig.co 2>/dev/null || curl -fsS --connect-timeout 5 --max-time 10 https://icanhazip.com 2>/dev/null || true)
     elif command -v wget >/dev/null 2>&1; then
-        external_ip=$(wget -qO- --timeout=10 ifconfig.me 2>/dev/null || wget -qO- --timeout=10 ifconfig.co 2>/dev/null)
+        external_ip=$(wget -qO- --timeout=10 https://ifconfig.me 2>/dev/null || wget -qO- --timeout=10 https://ifconfig.co 2>/dev/null || true)
     fi
     
     # Get local IP
@@ -541,17 +498,17 @@ send_ssh_alert() {
     if [[ -n "$key_comment" && "$key_comment" != "unknown" ]]; then
         person_info="$key_comment"
     else
-        person_info="Unknown"
+        person_info="$username"
     fi
     
-    local message="🔐 *SSH Login Alert:*
-*Host IP:* \`$server_ip\`
-*Host:* \`$full_server_name\`
-*Person:* \`$person_info\`
-*IP:* \`$ip_address\`
-*Type:* \`$connection_type\`
-*Key:* \`${key_fingerprint:0:16}...\`
-*Time:* \`$(date '+%Y-%m-%d %H:%M:%S UTC')\`"
+    local message="🔐 SSH Login Alert:
+Host IP: $server_ip
+Host: $full_server_name
+Person: $person_info
+IP: $ip_address
+Type: $connection_type
+Key: ${key_fingerprint}
+Time: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
     
     # Determine if notification should be silent
     local disable_sound="false"
@@ -560,36 +517,30 @@ send_ssh_alert() {
     fi
     
     # Send notification
-    send_telegram_message "$message" "$disable_sound"
+    if ! send_telegram_message "$message" "$disable_sound"; then
+        return 1
+    fi
+    date +%s > "$RATE_LIMIT_FILE" || return 1
     
     # Log the event
     log_info "SSH alert sent: $username@$full_server_name from $ip_address ($connection_type)"
     
     # JSON logging
-    local event_data=$(echo "$connection_info" | python3 -c "
+    local event_data
+    event_data=$(python3 - "$connection_info" "$key_info" "$full_server_name" "$username" "$disable_sound" <<'PY'
 import sys, json
-try:
-    data = json.load(sys.stdin)
-    data.update($key_info)
-    data['server_name'] = '$full_server_name'
-    data['notification_sent'] = True
-    data['sound_disabled'] = '$disable_sound'
-    print(json.dumps(data))
-except:
-    print('{\"error\": \"json_merge_failed\"}')
-")
+data = json.loads(sys.argv[1])
+data.update(json.loads(sys.argv[2]))
+data.update(server_name=sys.argv[3], username=sys.argv[4], notification_sent=True,
+            sound_disabled=sys.argv[5] == 'true')
+print(json.dumps(data))
+PY
+)
     log_json_event "$event_data"
-}
+)
 
 # Main function
 main() {
-    # Acquire lock to prevent concurrent executions
-    exec 200>"$LOCK_FILE"
-    if ! flock -n 200; then
-        log_debug "Another instance is running, exiting"
-        exit 0
-    fi
-    
     # Load configuration
     load_config
     
@@ -602,10 +553,11 @@ main() {
     # Parse basic info for key lookup
     local ip_address=$(echo "$connection_info" | python3 -c "import sys, json; data=json.load(sys.stdin); print(data.get('ip_address', 'unknown'))")
     local username=$(echo "$connection_info" | python3 -c "import sys, json; data=json.load(sys.stdin); print(data.get('username', 'unknown'))")
+    local source_port=$(echo "$connection_info" | python3 -c "import sys, json; data=json.load(sys.stdin); print(data.get('port', ''))")
     
     # Get key information
     local key_info
-    key_info=$(get_key_info "$ip_address" "$username")
+    key_info=$(get_key_info "$ip_address" "$username" "$source_port")
     
     # Send alert
     send_ssh_alert "$connection_info" "$key_info"

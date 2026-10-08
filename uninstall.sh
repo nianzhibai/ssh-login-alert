@@ -5,6 +5,7 @@
 # Safely removes SSH Alert from the system
 
 set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Colors for output
 RED='\033[0;31m'
@@ -37,6 +38,7 @@ confirm_uninstall() {
     echo "  - SSH Alert files from /opt/ssh-alert/"
     echo "  - Configuration files from /etc/ssh-alert/"
     echo "  - SSH integration from /etc/ssh/sshrc"
+    echo "  - Restricted helper rule from /etc/sudoers.d/ssh-alert"
     echo "  - Systemd service (if installed)"
     echo "  - Log rotation configuration"
     echo "  - Temporary files and rate limiting data"
@@ -56,7 +58,7 @@ stop_processes() {
     print_info "Stopping SSH Alert processes..."
     
     # Kill any running SSH Alert processes
-    pkill -f "ssh-alert" 2>/dev/null || true
+    pkill -f '^/bin/bash /opt/ssh-alert/ssh-alert-enhanced.sh$' 2>/dev/null || true
     
     # Stop systemd service if it exists
     if systemctl is-active --quiet ssh-alert 2>/dev/null; then
@@ -78,18 +80,10 @@ remove_ssh_integration() {
     
     # Remove SSH Alert from sshrc
     if [[ -f "/etc/ssh/sshrc" ]]; then
-        # Remove SSH Alert lines
-        sed -i '/# SSH Alert Integration/,/^$/d' "/etc/ssh/sshrc"
-        sed -i '/ssh-alert/d' "/etc/ssh/sshrc"
-        
-        # If sshrc is now empty or only contains comments, remove it
-        if [[ ! -s "/etc/ssh/sshrc" ]] || [[ -z "$(grep -v '^#' /etc/ssh/sshrc)" ]]; then
-            rm -f "/etc/ssh/sshrc"
-            print_info "Removed empty /etc/ssh/sshrc"
-        else
-            print_info "Cleaned /etc/ssh/sshrc"
-        fi
+        python3 "$SCRIPT_DIR/sshrc-editor.py" remove /etc/ssh/sshrc
+        print_info "Removed SSH Alert hook"
     fi
+    rm -f /etc/sudoers.d/ssh-alert
     
     # Remove AuthorizedKeysCommand if it was added
     if [[ -f "/etc/ssh/sshd_config" ]]; then
@@ -155,6 +149,7 @@ remove_files() {
     # Remove temporary files
     rm -f "/tmp/ssh-alert.lock"
     rm -rf "/tmp/ssh-alert-rate-limit"
+    rm -rf "/run/ssh-alert"
     print_success "Removed temporary files"
 }
 

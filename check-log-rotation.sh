@@ -77,7 +77,7 @@ check_log_status() {
 check_rate_limit_dir() {
     print_info "Checking rate limiting directory..."
     
-    local rate_dir="/tmp/ssh-alert-rate-limit"
+    local rate_dir="/run/ssh-alert/rate-limit"
     
     if [[ ! -d "$rate_dir" ]]; then
         print_info "Rate limiting directory not found (normal if no connections yet)"
@@ -85,10 +85,8 @@ check_rate_limit_dir() {
     fi
     
     local file_count=$(find "$rate_dir" -type f 2>/dev/null | wc -l)
-    local old_count=$(find "$rate_dir/old" -type f 2>/dev/null | wc -l || echo "0")
     
     print_info "Active rate limit files: $file_count"
-    print_info "Old rate limit files: $old_count"
     
     if [[ $file_count -gt 100 ]]; then
         print_warning "Many rate limit files found. Consider cleanup."

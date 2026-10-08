@@ -11,7 +11,7 @@ A secure and reliable utility for monitoring SSH connections to a server with Te
 
 - **Maximum user identification**: IP address, key fingerprint, key comment, connection type
 - **Flexible notifications**: Separate sound and silent messages for different connection types
-- **Reliability**: Prevention of duplicate notifications during parallel sessions
+- **Reliability**: Independent alerts for concurrent logins, with duplicate suppression per account/IP/key
 - **Retry logic**: Automatic retries on network or Telegram API failures
 - **Flexible configuration**: Configuration through config file
 - **Security**: Minimal dependencies, works without SSH client modifications
@@ -22,6 +22,8 @@ A secure and reliable utility for monitoring SSH connections to a server with Te
 - Python 3.6+
 - curl
 - bash 4.0+
+- sudo with `/etc/sudoers.d/` enabled, and visudo
+- flock, ss, logrotate, systemctl
 - Root privileges for installation
 
 ## 🛠 Installation
@@ -47,41 +49,19 @@ rm -rf ssh-login-alert
 ### What happens during installation
 
 1. **Files are copied** to `/opt/ssh-alert/` and `/etc/ssh-alert/`
-2. **SSH integration** is configured through `/etc/ssh/sshrc`
-3. **Log rotation configuration** is created
-4. **Interactive Telegram setup** is launched
-5. **Configuration is tested**
+2. **SSH integration** is added to `/etc/ssh/sshrc`, preserving existing commands
+3. **A restricted sudo helper** sends alerts for ordinary users while keeping Telegram credentials readable only by root
+4. **Log rotation configuration** is created
+5. **Interactive Telegram setup** is launched
+6. **Configuration is tested**
 
-### Manual Installation (if needed)
+### Installation details
 
-1. **Copy files**:
-   ```bash
-   sudo mkdir -p /opt/ssh-alert /etc/ssh-alert
-   sudo cp ssh-alert-enhanced.sh /opt/ssh-alert/
-   sudo cp key-parser.py /opt/ssh-alert/
-   sudo cp config.conf /etc/ssh-alert/
-   sudo cp logrotate.conf /etc/logrotate.d/ssh-alert
-   sudo chmod +x /opt/ssh-alert/*.sh
-   sudo chmod +x /opt/ssh-alert/*.py
-   ```
+The installer copies all runtime and management scripts to `/opt/ssh-alert/`. The SSH hook runs `ssh-alert-login.sh`, which passes session metadata to `ssh-alert-session.py` through a passwordless sudo rule. That rule allows only the installed helper with no command-line arguments and no caller environment overrides. The helper derives the login account from sudo's caller UID and starts the notifier with a minimal environment.
 
-2. **Configure SSH**:
-   ```bash
-   sudo tee /etc/ssh/sshrc > /dev/null << 'EOF'
-   #!/bin/bash
-   # SSH Alert Integration
-   if [ -n "${SSH_ALERT_DISABLED:-}" ]; then
-       exit 0
-   fi
-   /opt/ssh-alert/ssh-alert-enhanced.sh &
-   EOF
-   sudo chmod +x /etc/ssh/sshrc
-   ```
+Keep `/opt/ssh-alert/` and its scripts owned by root and unwritable by ordinary users. Telegram credentials remain in `/etc/ssh-alert/config.conf` with permissions `600`.
 
-3. **Configure settings**:
-   ```bash
-   sudo nano /etc/ssh-alert/config.conf
-   ```
+Re-running `sudo ./install.sh` preserves an existing configuration and replaces only SSH Alert's hook. Use the installer for upgrades so that the helper and its sudo rule are installed together.
 
 ## ⚙️ Configuration
 
@@ -111,17 +91,19 @@ RATE_LIMIT_PER_KEY=60
 
 ### authorized_keys Configuration
 
-For maximum user identification, configure `authorized_keys`:
+The parser reads the login account's `~/.ssh/authorized_keys` by default. Set `SSH_AUTHORIZED_KEYS_PATH` to a specific file only when needed. For installations upgraded from the earlier root-only default, set it to an empty string to enable automatic per-account selection:
 
 ```bash
-sudo ./setup-authorized-keys.sh
+SSH_AUTHORIZED_KEYS_PATH=""
 ```
 
-Or manually add `SSH_USER` to keys:
+Key comments identify the person in notifications. An optional label can also be stored in a key's options:
 
 ```
-environment="SSH_USER=alice@example.com" ssh-rsa AAAAB3NzaC1yc2E... alice@laptop
+environment="SSH_USER=alice@example.com" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI... alice@laptop
 ```
+
+The parser reads this option directly; OpenSSH does not need to export it into the session. It matches successful authentication logs by account, source IP and source port. Unidentified keys remain `unknown`; password logins use the login account for identification.
 
 ### Exclusions from Notifications
 
@@ -133,11 +115,11 @@ Exclude SSH keys by their comment in `authorized_keys`:
 
 ```bash
 # Add key comment exclusion
-sudo ./manage-exclusions.sh add key "pipeline@ci"
-sudo ./manage-exclusions.sh add key "deploy@automation"
+sudo /opt/ssh-alert/manage-exclusions.sh add key "pipeline@ci"
+sudo /opt/ssh-alert/manage-exclusions.sh add key "deploy@automation"
 
 # Remove key comment exclusion
-sudo ./manage-exclusions.sh remove key "pipeline@ci"
+sudo /opt/ssh-alert/manage-exclusions.sh remove key "pipeline@ci"
 ```
 
 #### 2. IP Address Exclusions
@@ -146,11 +128,11 @@ Exclude connections from specific IP addresses (useful for password-based runner
 
 ```bash
 # Add IP exclusion
-sudo ./manage-exclusions.sh add ip "192.168.1.100"
-sudo ./manage-exclusions.sh add ip "10.0.0.50"
+sudo /opt/ssh-alert/manage-exclusions.sh add ip "192.168.1.100"
+sudo /opt/ssh-alert/manage-exclusions.sh add ip "10.0.0.50"
 
 # Remove IP exclusion
-sudo ./manage-exclusions.sh remove ip "192.168.1.100"
+sudo /opt/ssh-alert/manage-exclusions.sh remove ip "192.168.1.100"
 ```
 
 #### 3. Username Exclusions
@@ -159,28 +141,28 @@ Exclude connections by username:
 
 ```bash
 # Add username exclusion
-sudo ./manage-exclusions.sh add user "gitlab-runner"
-sudo ./manage-exclusions.sh add user "jenkins"
+sudo /opt/ssh-alert/manage-exclusions.sh add user "gitlab-runner"
+sudo /opt/ssh-alert/manage-exclusions.sh add user "jenkins"
 
 # Remove username exclusion
-sudo ./manage-exclusions.sh remove user "gitlab-runner"
+sudo /opt/ssh-alert/manage-exclusions.sh remove user "gitlab-runner"
 ```
 
 #### Managing Exclusions
 
 ```bash
 # View all exclusions
-sudo ./manage-exclusions.sh list
+sudo /opt/ssh-alert/manage-exclusions.sh list
 
 # View specific type
-sudo ./manage-exclusions.sh list key
-sudo ./manage-exclusions.sh list ip
-sudo ./manage-exclusions.sh list user
+sudo /opt/ssh-alert/manage-exclusions.sh list key
+sudo /opt/ssh-alert/manage-exclusions.sh list ip
+sudo /opt/ssh-alert/manage-exclusions.sh list user
 
 # Clear all exclusions of a type
-sudo ./manage-exclusions.sh clear key
-sudo ./manage-exclusions.sh clear ip
-sudo ./manage-exclusions.sh clear user
+sudo /opt/ssh-alert/manage-exclusions.sh clear key
+sudo /opt/ssh-alert/manage-exclusions.sh clear ip
+sudo /opt/ssh-alert/manage-exclusions.sh clear user
 ```
 
 **Usage examples:**
@@ -210,8 +192,10 @@ sudo ./manage-exclusions.sh clear user
 # View logs
 sudo tail -f /var/log/ssh-alert.log
 
-# Test configuration
-sudo /opt/ssh-alert/ssh-alert-enhanced.sh
+# Check script and configuration syntax
+sudo bash -n /opt/ssh-alert/ssh-alert-enhanced.sh
+sudo bash -n /etc/ssh-alert/config.conf
+# Test notification delivery by opening a new SSH session
 
 # Log management
 sudo /opt/ssh-alert/check-log-rotation.sh status    # Check rotation status
@@ -219,12 +203,12 @@ sudo /opt/ssh-alert/check-log-rotation.sh test      # Test configuration
 sudo /opt/ssh-alert/check-log-rotation.sh rotate    # Force rotation
 
 # Exclusion management
-sudo ./manage-exclusions.sh list                    # Show all exclusions
-sudo ./manage-exclusions.sh add key "pipeline@ci"   # Add key exclusion
-sudo ./manage-exclusions.sh add ip "192.168.1.100"  # Add IP exclusion
-sudo ./manage-exclusions.sh add user "gitlab-runner" # Add user exclusion
-sudo ./manage-exclusions.sh remove key "pipeline@ci" # Remove key exclusion
-sudo ./manage-exclusions.sh clear key               # Clear key exclusions
+sudo /opt/ssh-alert/manage-exclusions.sh list                    # Show all exclusions
+sudo /opt/ssh-alert/manage-exclusions.sh add key "pipeline@ci"   # Add key exclusion
+sudo /opt/ssh-alert/manage-exclusions.sh add ip "192.168.1.100"  # Add IP exclusion
+sudo /opt/ssh-alert/manage-exclusions.sh add user "gitlab-runner" # Add user exclusion
+sudo /opt/ssh-alert/manage-exclusions.sh remove key "pipeline@ci" # Remove key exclusion
+sudo /opt/ssh-alert/manage-exclusions.sh clear key               # Clear key exclusions
 
 # Uninstall
 sudo /opt/ssh-alert/uninstall.sh
@@ -232,11 +216,13 @@ sudo /opt/ssh-alert/uninstall.sh
 
 ### Notification Types
 
-SSH Alert distinguishes the following connection types:
+The login hook distinguishes the following session types:
 
 - **Interactive shell** - Interactive session (default with sound)
-- **Tunnel** - SSH tunnel (default without sound)
-- **Command execution** - Command execution (configurable)
+- **Tunnel** - Session explicitly marked with `SSH_TUNNEL` (default without sound)
+- **Command execution** - Session without a TTY, or a forced command (configurable)
+
+OpenSSH does not run `sshrc` for a pure forwarding connection such as `ssh -N`. Such connections do not trigger this login hook. If `~/.ssh/rc` is enabled for an account, OpenSSH uses that file instead of `/etc/ssh/sshrc`; add `/opt/ssh-alert/ssh-alert-login.sh >/dev/null 2>&1 &` to its rc file to receive alerts for that account.
 
 ### Notification Example
 
@@ -292,16 +278,13 @@ SSH Alert automatically configures log rotation through `logrotate`:
 
 ```bash
 # Check rotation status
-make check-logs
+sudo /opt/ssh-alert/check-log-rotation.sh status
 
 # Test rotation configuration
-make test-logs
+sudo /opt/ssh-alert/check-log-rotation.sh test
 
 # Force rotation
-make rotate-logs
-
-# Manual check
-sudo ./check-log-rotation.sh status
+sudo /opt/ssh-alert/check-log-rotation.sh rotate
 ```
 
 **Rotation settings:**
@@ -310,7 +293,7 @@ sudo ./check-log-rotation.sh status
 - 🗜️ **Compression** of old logs
 - 📏 **Minimum size** 100KB for rotation
 - 📏 **Maximum size** 10MB for forced rotation
-- 🧹 **Cleanup** of rate limiting temporary files
+- 🧹 Rate limiting state stays in the private `/run/ssh-alert/` directory and resets on reboot
 
 ## 🔍 Troubleshooting
 
@@ -318,8 +301,8 @@ sudo ./check-log-rotation.sh status
 
 1. **Post-installation errors**:
    ```bash
-   # If you see errors like "[[ not found" or "config.conf not found"
-   sudo ./fix-installation.sh
+   # Re-run from the repository to reinstall scripts and integration
+   sudo ./install.sh
    ```
 
 2. **Notifications not arriving**:
@@ -382,7 +365,7 @@ SSH Alert can integrate with monitoring systems through JSON logs:
 echo 'JSON_LOGGING=true' | sudo tee -a /etc/ssh-alert/config.conf
 
 # Parse logs
-sudo tail -f /var/log/ssh-alert.log | jq '.'
+sudo tail -f /var/log/ssh-alert.log | jq -R 'fromjson?'
 ```
 
 ## 🔄 Updates
@@ -395,20 +378,9 @@ git pull origin main
 sudo ./install.sh
 ```
 
-### Manual Update
+### Upgrade behavior
 
-```bash
-# Create backup
-sudo cp -r /opt/ssh-alert /opt/ssh-alert.backup
-sudo cp /etc/ssh-alert/config.conf /etc/ssh-alert/config.conf.backup
-
-# Update files
-sudo cp ssh-alert-enhanced.sh /opt/ssh-alert/
-sudo cp key-parser.py /opt/ssh-alert/
-sudo cp uninstall.sh /opt/ssh-alert/
-sudo cp check-log-rotation.sh /opt/ssh-alert/
-sudo cp logrotate.conf /etc/logrotate.d/ssh-alert
-```
+The installer keeps `/etc/ssh-alert/config.conf`, including credentials and exclusions. It backs up `/etc/ssh/sshrc` before updating the managed hook. Update through `sudo ./install.sh` so runtime scripts, sudo permissions and log rotation stay consistent.
 
 ## 🗑️ Uninstallation
 
@@ -422,7 +394,7 @@ sudo /opt/ssh-alert/uninstall.sh
 ### What gets removed
 
 - ✅ All SSH Alert files
-- ✅ SSH integration from `/etc/ssh/sshrc`
+- ✅ SSH Alert hook from `/etc/ssh/sshrc` and its restricted sudo rule
 - ✅ Systemd service
 - ✅ Log rotation configuration
 - ✅ Temporary files and cache
@@ -430,21 +402,15 @@ sudo /opt/ssh-alert/uninstall.sh
 
 ### Manual Removal
 
+Run the installed uninstaller to preserve unrelated SSH initialization commands. It removes the managed hook and `/etc/sudoers.d/ssh-alert` before deleting the installed files. It also cleans `/run/ssh-alert/` and legacy temporary state; log files are retained.
+
+## Development checks
+
 ```bash
-# Stop processes
-sudo pkill -f ssh-alert
-
-# Remove files
-sudo rm -rf /opt/ssh-alert
-sudo rm -rf /etc/ssh-alert
-
-# Clear SSH integration
-sudo rm -f /etc/ssh/sshrc
-
-# Remove temporary files
-sudo rm -f /tmp/ssh-alert.lock
-sudo rm -rf /tmp/ssh-alert-rate-limit
+python3 -m unittest discover -s tests -v
 ```
+
+Tests use temporary files and mocked Telegram requests. They cover key options, account exclusions, concurrent notifications, version checks, helper input validation and upgrade preservation.
 
 ## 📝 License
 
@@ -463,7 +429,7 @@ This project is distributed under the MIT license. See the `LICENSE` file for de
 If you encounter problems or have questions:
 
 1. Check the [troubleshooting section](#troubleshooting)
-2. Create an [Issue](https://github.com/your-repo/ssh-alert/issues)
+2. Create an [Issue](https://github.com/B4DCATs/ssh-login-alert/issues)
 3. Refer to the documentation
 
 ## 🔮 Development Roadmap
