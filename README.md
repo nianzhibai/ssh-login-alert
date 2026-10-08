@@ -85,11 +85,22 @@ NOTIFY_INTERACTIVE_SESSIONS=true
 NOTIFY_TUNNELS=false
 NOTIFY_COMMANDS=false
 DISABLE_NOTIFICATION_SOUND_FOR_TUNNELS=true
+NOTIFICATION_TIMEZONE="UTC"
 
 # Rate Limiting (seconds)
 RATE_LIMIT_PER_IP=300
 RATE_LIMIT_PER_KEY=60
 ```
+
+### Notification time zone
+
+Set `NOTIFICATION_TIMEZONE` in `/etc/ssh-alert/config.conf` to an IANA time zone name:
+
+- `UTC` (default)
+- `Asia/Shanghai` (China Standard Time, UTC+8)
+- `Europe/Berlin` (automatically follows daylight saving time)
+
+The notification's `Time` field includes the time zone abbreviation and UTC offset, for example `2026-10-08 20:09:44 CST (+0800)`. Invalid names produce a warning and fall back to UTC. Changes apply to new notifications immediately. This setting controls the notification time; text logs use the server time zone and JSON timestamps use UTC.
 
 ### authorized_keys Configuration
 
@@ -236,7 +247,7 @@ Person: alice@example.com
 IP: 198.51.100.50
 Type: Interactive shell
 Key: SHA256:abcd1234...
-Time: 2024-01-15 14:30:25 UTC
+Time: 2024-01-15 14:30:25 UTC (+0000)
 ```
 
 ## 🛡 Security

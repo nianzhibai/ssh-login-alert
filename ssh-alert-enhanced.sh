@@ -60,6 +60,17 @@ log_warning() { log "WARNING" "$@"; }
 log_error() { log "ERROR" "$@"; }
 log_debug() { log "DEBUG" "$@"; }
 
+# Format only the notification time using the selected IANA time zone.
+format_notification_time() {
+    local notification_timezone="${NOTIFICATION_TIMEZONE:-UTC}"
+    if [[ ! "$notification_timezone" =~ ^[A-Za-z0-9_+-]+(/[A-Za-z0-9_+-]+)*$ ]] || \
+       [[ ! -f "/usr/share/zoneinfo/$notification_timezone" ]]; then
+        log_warning "Invalid NOTIFICATION_TIMEZONE: $notification_timezone; using UTC"
+        notification_timezone="UTC"
+    fi
+    TZ="$notification_timezone" date '+%Y-%m-%d %H:%M:%S %Z (%z)'
+}
+
 # Rate limiting functions
 check_rate_limit() {
     local key="$1"
@@ -508,7 +519,7 @@ Person: $person_info
 IP: $ip_address
 Type: $connection_type
 Key: ${key_fingerprint}
-Time: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+Time: $(format_notification_time)"
     
     # Determine if notification should be silent
     local disable_sound="false"

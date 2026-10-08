@@ -171,6 +171,50 @@ send_ssh_alert {connection} {key}
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse(self.marker.exists())
 
+    def test_notification_time_uses_selected_zone(self):
+        extra = '''NOTIFICATION_TIMEZONE=Asia/Shanghai
+date() { /usr/bin/date --date='2026-10-08 12:09:44 UTC' "$@"; }
+'''
+        result = bash(self.script(extra=extra))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('Time: 2026-10-08 20:09:44 CST (+0800)', self.marker.read_text())
+
+    def test_notification_time_defaults_to_utc(self):
+        result = bash('''source ./ssh-alert-enhanced.sh
+unset NOTIFICATION_TIMEZONE
+date() { /usr/bin/date --date='2026-10-08 12:09:44 UTC' "$@"; }
+format_notification_time
+''')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), '2026-10-08 12:09:44 UTC (+0000)')
+
+    def test_notification_zone_handles_berlin_daylight_saving_time(self):
+        for instant, expected in [('2026-10-08 12:09:44 UTC', '2026-10-08 14:09:44 CEST (+0200)'),
+                                  ('2026-01-15 12:09:44 UTC', '2026-01-15 13:09:44 CET (+0100)')]:
+            with self.subTest(instant=instant):
+                script = '''source ./ssh-alert-enhanced.sh
+NOTIFICATION_TIMEZONE=Europe/Berlin
+date() {{ /usr/bin/date --date={instant} "$@"; }}
+format_notification_time
+'''.format(instant=shlex.quote(instant))
+                result = bash(script)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.strip(), expected)
+
+    def test_invalid_notification_zone_warns_and_falls_back(self):
+        for zone in ['Invalid/Zone', '../../etc/passwd']:
+            with self.subTest(zone=zone):
+                log = self.path / 'timezone.log'
+                result = bash('''source ./ssh-alert-enhanced.sh
+LOG_FILE="$1"
+NOTIFICATION_TIMEZONE="$2"
+date() { /usr/bin/date --date='2026-10-08 12:09:44 UTC' "$@"; }
+format_notification_time
+''', str(log), zone)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.strip(), '2026-10-08 12:09:44 UTC (+0000)')
+                self.assertIn('Invalid NOTIFICATION_TIMEZONE', log.read_text())
+
     def test_success_keeps_correct_user_and_handles_quotes_in_json(self):
         result = bash(self.script(extra="JSON_LOGGING=true\nSERVER_NAME=\"host's\"", label="Alice's laptop"))
         self.assertEqual(result.returncode, 0, result.stderr)
