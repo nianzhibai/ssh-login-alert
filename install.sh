@@ -43,7 +43,7 @@ check_requirements() {
     print_info "Checking system requirements..."
     
     # Check for required commands
-    local required_commands=("curl" "python3" "flock" "ss" "sudo" "visudo" "logrotate" "systemctl")
+    local required_commands=("curl" "python3" "flock" "ss" "sudo" "visudo" "logrotate")
     for cmd in "${required_commands[@]}"; do
         if ! command -v "$cmd" &> /dev/null; then
             print_error "Required command not found: $cmd"
@@ -126,31 +126,6 @@ configure_ssh() {
     chmod 755 "$SSHRC_FILE"
     
     print_success "SSH configuration completed"
-}
-
-# Create systemd service (optional)
-create_systemd_service() {
-    print_info "Creating systemd service..."
-    
-    cat > "/etc/systemd/system/ssh-alert.service" << EOF
-[Unit]
-Description=SSH Alert Monitoring Service
-After=network.target
-
-[Service]
-Type=oneshot
-User=root
-ExecStart=/opt/ssh-alert/ssh-alert-enhanced.sh
-StandardOutput=journal
-StandardError=journal
-
-[Install]
-WantedBy=multi-user.target
-EOF
-    
-    systemctl daemon-reload
-    
-    print_success "Systemd service created"
 }
 
 # Setup log rotation
@@ -311,7 +286,6 @@ main() {
     create_directories
     install_files
     configure_privileges
-    create_systemd_service
     setup_log_rotation
     interactive_config
     test_configuration

@@ -23,7 +23,7 @@ A secure and reliable utility for monitoring SSH connections to a server with Te
 - curl
 - bash 4.0+
 - sudo with `/etc/sudoers.d/` enabled, and visudo
-- flock, ss, logrotate, systemctl
+- flock, ss, logrotate
 - Root privileges for installation
 
 ## 🛠 Installation
@@ -60,6 +60,8 @@ rm -rf ssh-login-alert
 The installer copies all runtime and management scripts to `/opt/ssh-alert/`. The SSH hook runs `ssh-alert-login.sh`, which passes session metadata to `ssh-alert-session.py` through a passwordless sudo rule. That rule allows only the installed helper with no command-line arguments and no caller environment overrides. The helper derives the login account from sudo's caller UID and starts the notifier with a minimal environment.
 
 Keep `/opt/ssh-alert/` and its scripts owned by root and unwritable by ordinary users. Telegram credentials remain in `/etc/ssh-alert/config.conf` with permissions `600`.
+
+Notifications run as a short-lived background process triggered by the SSH login hook.
 
 Re-running `sudo ./install.sh` preserves an existing configuration and replaces only SSH Alert's hook. Use the installer for upgrades so that the helper and its sudo rule are installed together.
 
@@ -346,8 +348,8 @@ sudo nano /etc/ssh-alert/config.conf
 ### System Check
 
 ```bash
-# System status
-sudo systemctl status ssh-alert 2>/dev/null || echo "Service not installed"
+# Check the SSH login hook
+sudo grep -F '/opt/ssh-alert/ssh-alert-login.sh' /etc/ssh/sshrc
 
 # Active connections
 sudo ss -tnp | grep sshd
@@ -395,7 +397,7 @@ sudo /opt/ssh-alert/uninstall.sh
 
 - ✅ All SSH Alert files
 - ✅ SSH Alert hook from `/etc/ssh/sshrc` and its restricted sudo rule
-- ✅ Systemd service
+- ✅ Legacy systemd service, if present from an older installation
 - ✅ Log rotation configuration
 - ✅ Temporary files and cache
 - ✅ Backup copies are created

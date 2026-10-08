@@ -39,7 +39,7 @@ confirm_uninstall() {
     echo "  - Configuration files from /etc/ssh-alert/"
     echo "  - SSH integration from /etc/ssh/sshrc"
     echo "  - Restricted helper rule from /etc/sudoers.d/ssh-alert"
-    echo "  - Systemd service (if installed)"
+    echo "  - Legacy systemd service (if installed)"
     echo "  - Log rotation configuration"
     echo "  - Temporary files and rate limiting data"
     echo
@@ -60,7 +60,7 @@ stop_processes() {
     # Kill any running SSH Alert processes
     pkill -f '^/bin/bash /opt/ssh-alert/ssh-alert-enhanced.sh$' 2>/dev/null || true
     
-    # Stop systemd service if it exists
+    # Stop a legacy systemd service from an older installation, if present.
     if systemctl is-active --quiet ssh-alert 2>/dev/null; then
         systemctl stop ssh-alert 2>/dev/null || true
     fi
@@ -104,7 +104,7 @@ remove_ssh_integration() {
     print_success "SSH integration removed"
 }
 
-# Remove systemd service
+# Remove a legacy systemd service left by an older installation.
 remove_systemd_service() {
     print_info "Removing systemd service..."
     
@@ -207,7 +207,7 @@ show_completion() {
     print_info "Summary of actions taken:"
     echo "  ✓ Stopped SSH Alert processes"
     echo "  ✓ Removed SSH integration"
-    echo "  ✓ Removed systemd service"
+    echo "  ✓ Cleaned any legacy systemd service"
     echo "  ✓ Removed log rotation configuration"
     echo "  ✓ Removed SSH Alert files"
     echo "  ✓ Cleaned up temporary files"
